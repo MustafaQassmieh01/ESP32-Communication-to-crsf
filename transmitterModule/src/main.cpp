@@ -39,12 +39,12 @@ enum CommandType : uint8_t {
   CMD_KILL
 };
 
-struct __attribute__((packed)) ControlPacket {
+struct ControlPacket {
   uint32_t seq;
   uint8_t command;
   int16_t value;
   uint16_t durationMs;
-};
+} __attribute__((packed));
 
 // ============================================================
 // MARK: GLOBAL STATE

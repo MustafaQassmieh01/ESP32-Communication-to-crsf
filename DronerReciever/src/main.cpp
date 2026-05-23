@@ -7,12 +7,27 @@
 #include <esp_now.h>
 #include <esp_wifi.h>
 
+#ifndef CRSF_TX_PIN
+#define CRSF_TX_PIN 17
+#endif
+
+#ifndef CRSF_RX_PIN
+#define CRSF_RX_PIN -1
+#endif
+
+#ifndef CRSF_BAUD
+#define CRSF_BAUD 420000
+#endif
+
 // ============================================================
 // MARK: CONFIGURATION CONSTANTS
 // ============================================================
 
 namespace ReceiverConfig {
 constexpr uint8_t kEspNowChannel = 1;
+constexpr int8_t kCrsfTxPin = CRSF_TX_PIN;
+constexpr int8_t kCrsfRxPin = CRSF_RX_PIN;
+constexpr uint32_t kCrsfBaud = CRSF_BAUD;
 
 constexpr uint16_t kRcMin = 1000;
 constexpr uint16_t kRcMid = 1500;
@@ -25,6 +40,17 @@ constexpr uint32_t kHoverFailsafeMs = 7000; // This is the number of seconds wit
 constexpr uint32_t kLandFailsafeMs = 30000; // This is the number of seconds without a command before the drone should enter landing failsafe mode.(should start after hover failsafe)
 constexpr uint32_t kLoopDelayMs = 20;
 constexpr uint32_t kDebugPrintIntervalMs = 500;
+}
+
+namespace CrsfConfig {
+constexpr uint8_t kAddressFlightController = 0xC8;
+constexpr uint8_t kFrameTypeRcChannelsPacked = 0x16;
+constexpr uint8_t kRcPayloadSize = 22;
+constexpr uint8_t kFrameSize = 26;
+constexpr uint8_t kFrameLength = 24;
+constexpr uint16_t kCrsfMin = 172;
+constexpr uint16_t kCrsfMid = 992;
+constexpr uint16_t kCrsfMax = 1811;
 }
 
 // ============================================================
@@ -106,12 +132,12 @@ enum class DroneState : uint8_t {
   KILL
 };
 
-struct __attribute__((packed)) ControlPacket {
+struct ControlPacket {
   uint32_t seq;
   uint8_t command;
   int16_t value;
   uint16_t durationMs;
-};
+} __attribute__((packed));
 
 struct RcChannels {
   uint16_t roll;
@@ -221,6 +247,24 @@ uint16_t slewTowards(uint16_t current, uint16_t target, uint16_t step) {
   return static_cast<uint16_t>(next < target ? target : next);
 }
 
+uint8_t crc8DvbS2(const uint8_t *data, uint8_t len) {
+  uint8_t crc = 0;
+  while (len--) {
+    crc ^= *data++;
+    for (uint8_t bit = 0; bit < 8; ++bit) {
+      crc = (crc & 0x80) ? static_cast<uint8_t>((crc << 1) ^ 0xD5) : static_cast<uint8_t>(crc << 1);
+    }
+  }
+  return crc;
+}
+
+uint16_t rcUsToCrsf(uint16_t us) {
+  const uint16_t limitedUs = clampRc(us);
+  const int32_t centered = static_cast<int32_t>(limitedUs) - ReceiverConfig::kRcMid;
+  const int32_t crsf = CrsfConfig::kCrsfMid + ((centered * 819) / 500);
+  return constrain(crsf, CrsfConfig::kCrsfMin, CrsfConfig::kCrsfMax);
+}
+
 void setNeutralTargets() {
   targetChannels.roll = ReceiverConfig::kRcMid;
   targetChannels.pitch = ReceiverConfig::kRcMid;
@@ -233,6 +277,10 @@ void setThrottleTarget(uint16_t throttle) {
 
 void setHoverThrottleTarget() {
   setThrottleTarget(gVehicleTuning.hoverThrottle);
+}
+
+void setArmTarget(bool armed) {
+  targetChannels.aux1 = armed ? ReceiverConfig::kRcMax : ReceiverConfig::kRcMin;
 }
 
 uint16_t makeThrottleFromPercent(int percent) {
@@ -420,9 +468,14 @@ void applyCommand(const ControlPacket &packet) {
     case CMD_STOP:
     case CMD_DISARM:
       gDroneState = DroneState::IDLE;
+      setArmTarget(false);
       motion = cmdStop();
       break;
     case CMD_ARM:
+      setArmTarget(true);
+      gDroneState = DroneState::ACTIVE;
+      motion = cmdStop();
+      break;
     case CMD_HOVER:
       gDroneState = DroneState::ACTIVE;
       motion = cmdHover();
@@ -571,7 +624,7 @@ void handleFailsafeTimeouts() {
 }
 
 // ============================================================
-// MARK: OUTPUT UPDATE AND CRSF PLACEHOLDER
+// MARK: OUTPUT UPDATE AND CRSF
 // ============================================================
 
 void updateCurrentChannels() {
@@ -590,9 +643,45 @@ void updateCurrentChannels() {
 }
 
 void sendCrsfChannels(const RcChannels &ch) {
-  // Placeholder for future CRSF encoding/output. Keep behavior logic isolated
-  // from protocol-specific serialization until the CRSF module is added.
-  (void)ch;
+  uint16_t channels[16] = {
+    rcUsToCrsf(ch.roll),
+    rcUsToCrsf(ch.pitch),
+    rcUsToCrsf(ch.throttle),
+    rcUsToCrsf(ch.yaw),
+    rcUsToCrsf(ch.aux1),
+    rcUsToCrsf(ch.aux2),
+    rcUsToCrsf(ch.aux3),
+    rcUsToCrsf(ch.aux4),
+    CrsfConfig::kCrsfMid,
+    CrsfConfig::kCrsfMid,
+    CrsfConfig::kCrsfMid,
+    CrsfConfig::kCrsfMid,
+    CrsfConfig::kCrsfMid,
+    CrsfConfig::kCrsfMid,
+    CrsfConfig::kCrsfMid,
+    CrsfConfig::kCrsfMid,
+  };
+
+  uint8_t frame[CrsfConfig::kFrameSize] = {};
+  frame[0] = CrsfConfig::kAddressFlightController;
+  frame[1] = CrsfConfig::kFrameLength;
+  frame[2] = CrsfConfig::kFrameTypeRcChannelsPacked;
+
+  uint32_t bitBuffer = 0;
+  uint8_t bitsInBuffer = 0;
+  uint8_t payloadIndex = 3;
+  for (uint8_t i = 0; i < 16; ++i) {
+    bitBuffer |= static_cast<uint32_t>(channels[i] & 0x07FF) << bitsInBuffer;
+    bitsInBuffer += 11;
+    while (bitsInBuffer >= 8 && payloadIndex < 3 + CrsfConfig::kRcPayloadSize) {
+      frame[payloadIndex++] = static_cast<uint8_t>(bitBuffer & 0xFF);
+      bitBuffer >>= 8;
+      bitsInBuffer -= 8;
+    }
+  }
+
+  frame[CrsfConfig::kFrameSize - 1] = crc8DvbS2(&frame[2], CrsfConfig::kFrameLength - 1);
+  Serial2.write(frame, sizeof(frame));
 }
 
 // ============================================================
@@ -614,7 +703,9 @@ void printDebugStatus() {
     portEXIT_CRITICAL(&gPacketMux);
 
     Serial.print("Rejected packet with size ");
-    Serial.println(invalidLen);
+    Serial.print(invalidLen);
+    Serial.print(" expected=");
+    Serial.println(sizeof(ControlPacket));
   }
 
   Serial.print("packetAgeMs=");
@@ -643,6 +734,11 @@ void printDebugStatus() {
 
 void setup() {
   Serial.begin(115200);
+  Serial2.begin(
+      ReceiverConfig::kCrsfBaud,
+      SERIAL_8N1,
+      ReceiverConfig::kCrsfRxPin,
+      ReceiverConfig::kCrsfTxPin);
   delay(1000);
 
   WiFi.mode(WIFI_STA);
@@ -664,6 +760,11 @@ void setup() {
   currentChannels = targetChannels;
 
   Serial.println("ESP-NOW initialized and receive callback registered");
+  Serial.print("CRSF output on GPIO");
+  Serial.print(ReceiverConfig::kCrsfTxPin);
+  Serial.print(" at ");
+  Serial.print(ReceiverConfig::kCrsfBaud);
+  Serial.println(" baud");
   Serial.print("Receiver MAC: ");
   Serial.println(WiFi.macAddress());
 }

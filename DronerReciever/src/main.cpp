@@ -40,11 +40,27 @@ constexpr uint32_t kHoverFailsafeMs = 7000; // This is the number of seconds wit
 constexpr uint32_t kLandFailsafeMs = 30000; // This is the number of seconds without a command before the drone should enter landing failsafe mode.(should start after hover failsafe)
 constexpr uint32_t kLoopDelayMs = 20;
 constexpr uint32_t kDebugPrintIntervalMs = 500;
+constexpr uint8_t kDistanceProfileMinPercent = 25;
+constexpr uint8_t kMinGpsSatellites = 4;
+constexpr uint32_t kGpsTelemetryTimeoutMs = 3000;
+constexpr double kEarthRadiusCm = 637100000.0;
+
+// Optional hover assist that uses GPS altitude to bias throttle around hoverThrottle.
+constexpr bool kEnableGpsAltitudeHoldAssist = true;
+// Ignore small altitude noise before applying any throttle correction.
+constexpr int16_t kAltitudeHoldDeadbandCm = 120;
+// Limit correction authority so GPS hold cannot command aggressive throttle steps.
+constexpr uint8_t kAltitudeHoldMaxCorrectionPercent = 10;
+// Proportional gain: throttle correction percentage per meter of altitude error.
+constexpr float kAltitudeHoldKpPercentPerMeter = 4.0f;
 }
 
 namespace CrsfConfig {
 constexpr uint8_t kAddressFlightController = 0xC8;
+constexpr uint8_t kFrameTypeGps = 0x02;
 constexpr uint8_t kFrameTypeRcChannelsPacked = 0x16;
+constexpr uint8_t kGpsPayloadSize = 15;
+constexpr uint8_t kMaxFrameSize = 64;
 constexpr uint8_t kRcPayloadSize = 22;
 constexpr uint8_t kFrameSize = 26;
 constexpr uint8_t kFrameLength = 24;
@@ -120,7 +136,8 @@ enum CommandType : uint8_t {
   CMD_UP,
   CMD_DOWN,
   CMD_HOVER,
-  CMD_KILL // failsafe command to immediately cut throttle, bypassing smoothing and safety checks. Should be used in emergencies only.
+  CMD_KILL, // failsafe command to immediately cut throttle, bypassing smoothing and safety checks. Should be used in emergencies only.
+  CMD_PING
 };
 
 enum class DroneState : uint8_t {
@@ -135,8 +152,25 @@ enum class DroneState : uint8_t {
 struct ControlPacket {
   uint32_t seq;
   uint8_t command;
-  int16_t value;
+  uint16_t distanceCm;
   uint16_t durationMs;
+} __attribute__((packed));
+
+enum FeedbackStatus : uint8_t {
+  FEEDBACK_ACCEPTED = 0,
+  FEEDBACK_REJECTED_STALE,
+  FEEDBACK_REJECTED_GPS,
+  FEEDBACK_INVALID
+};
+
+struct FeedbackPacket {
+  uint32_t seq;
+  uint8_t command;
+  uint8_t status;
+  uint8_t state;
+  uint16_t distanceCm;
+  uint16_t progressCm;
+  uint32_t receiverMillis;
 } __attribute__((packed));
 
 struct RcChannels {
@@ -166,6 +200,40 @@ struct MotionTargets {
   bool useHoverThrottle = true;
 };
 
+struct DistanceMoveState {
+  bool active = false;
+  bool hasStartGps = false;
+  bool useVerticalDistance = false;
+  uint8_t command = CMD_HOVER;
+  uint16_t targetDistanceCm = 0;
+  uint16_t traveledDistanceCm = 0;
+  int32_t startLatitudeE7 = 0;
+  int32_t startLongitudeE7 = 0;
+  int32_t startAltitudeCm = 0;
+};
+
+struct GpsTelemetry {
+  bool valid = false;
+  int32_t latitudeE7 = 0;
+  int32_t longitudeE7 = 0;
+  int32_t altitudeCm = 0;
+  uint16_t groundSpeedKmh10 = 0;
+  uint16_t headingDeg100 = 0;
+  uint8_t satellites = 0;
+  uint32_t lastUpdateMs = 0;
+};
+
+struct AltitudeHoldState {
+  bool engaged = false;
+  int32_t targetAltitudeCm = 0;
+};
+
+struct CrsfRxParser {
+  uint8_t frame[CrsfConfig::kMaxFrameSize] = {};
+  uint8_t index = 0;
+  uint8_t expectedSize = 0;
+};
+
 // ============================================================
 // MARK: GLOBAL STATE
 // ============================================================
@@ -175,6 +243,7 @@ volatile bool gSawInvalidPacketSize = false;
 volatile bool gKillLatched = false; // Latched emergency stop. Cleared only by receiver reset.
 volatile int gLastInvalidPacketSize = 0;
 ControlPacket gPendingPacket = {};
+uint8_t gPendingSenderMac[6] = {};
 portMUX_TYPE gPacketMux = portMUX_INITIALIZER_UNLOCKED;
 
 LinkStats gLinkStats;
@@ -198,6 +267,10 @@ VehicleTuning gVehicleTuning;
 CommandTuning gCommandTuning;
 SafetyTuning gSafetyTuning;
 OutputSmoothingTuning gOutputSmoothing;
+DistanceMoveState gDistanceMove;
+GpsTelemetry gGpsTelemetry;
+CrsfRxParser gCrsfRxParser;
+AltitudeHoldState gAltitudeHold;
 
 uint32_t gLastDebugPrintAtMs = 0;
 
@@ -234,6 +307,11 @@ uint16_t percentToThrottle(int percent, float multiplier = 1.0f) {
   return clampRc(ReceiverConfig::kRcMin + offset);
 }
 
+uint8_t throttleToPercent(uint16_t throttleUs) {
+  const uint16_t limited = clampRc(throttleUs);
+  return static_cast<uint8_t>(((static_cast<uint32_t>(limited - ReceiverConfig::kRcMin)) * 100U) / 1000U);
+}
+
 // Smoothly slews a current RC value towards a target value by a specified step amount, ensuring it does not overshoot the target.
 uint16_t slewTowards(uint16_t current, uint16_t target, uint16_t step) {
   if (current == target || step == 0) {
@@ -258,6 +336,122 @@ uint8_t crc8DvbS2(const uint8_t *data, uint8_t len) {
   return crc;
 }
 
+
+int32_t readBigEndianInt32(const uint8_t *data) {
+  return static_cast<int32_t>(
+      (static_cast<uint32_t>(data[0]) << 24) |
+      (static_cast<uint32_t>(data[1]) << 16) |
+      (static_cast<uint32_t>(data[2]) << 8) |
+      static_cast<uint32_t>(data[3]));
+}
+
+uint16_t readBigEndianUint16(const uint8_t *data) {
+  return static_cast<uint16_t>((static_cast<uint16_t>(data[0]) << 8) | data[1]);
+}
+
+uint16_t clampDistanceCm(uint32_t distanceCm) {
+  return distanceCm > 65535U ? 65535U : static_cast<uint16_t>(distanceCm);
+}
+
+bool hasRecentGpsFix() {
+  return gGpsTelemetry.valid &&
+         gGpsTelemetry.satellites >= ReceiverConfig::kMinGpsSatellites &&
+         millis() - gGpsTelemetry.lastUpdateMs <= ReceiverConfig::kGpsTelemetryTimeoutMs;
+}
+
+bool isVerticalDistanceCommand(uint8_t command) {
+  return command == CMD_UP || command == CMD_DOWN;
+}
+
+uint16_t horizontalDistanceCm(int32_t startLatitudeE7, int32_t startLongitudeE7, int32_t currentLatitudeE7, int32_t currentLongitudeE7) {
+  const double degToRad = 0.017453292519943295;
+  const double startLatitudeRad = (static_cast<double>(startLatitudeE7) / 10000000.0) * degToRad;
+  const double currentLatitudeRad = (static_cast<double>(currentLatitudeE7) / 10000000.0) * degToRad;
+  const double deltaLatitudeRad = currentLatitudeRad - startLatitudeRad;
+  const double deltaLongitudeRad = ((static_cast<double>(currentLongitudeE7 - startLongitudeE7)) / 10000000.0) * degToRad;
+  const double x = deltaLongitudeRad * cos((startLatitudeRad + currentLatitudeRad) * 0.5);
+  const double y = deltaLatitudeRad;
+  const double distanceCm = sqrt((x * x) + (y * y)) * ReceiverConfig::kEarthRadiusCm;
+
+  if (distanceCm <= 0.0) {
+    return 0;
+  }
+  return clampDistanceCm(static_cast<uint32_t>(distanceCm + 0.5));
+}
+
+void processGpsTelemetryPayload(const uint8_t *payload, uint8_t payloadLen) {
+  if (payloadLen != CrsfConfig::kGpsPayloadSize) {
+    return;
+  }
+
+  gGpsTelemetry.latitudeE7 = readBigEndianInt32(&payload[0]);
+  gGpsTelemetry.longitudeE7 = readBigEndianInt32(&payload[4]);
+  gGpsTelemetry.groundSpeedKmh10 = readBigEndianUint16(&payload[8]);
+  gGpsTelemetry.headingDeg100 = readBigEndianUint16(&payload[10]);
+  gGpsTelemetry.altitudeCm = (static_cast<int32_t>(readBigEndianUint16(&payload[12])) - 1000) * 100;
+  gGpsTelemetry.satellites = payload[14];
+  gGpsTelemetry.lastUpdateMs = millis();
+  gGpsTelemetry.valid = true;
+}
+
+void processCrsfTelemetryFrame(const uint8_t *frame, uint8_t frameSize) {
+  if (frameSize < 5) {
+    return;
+  }
+
+  const uint8_t frameLength = frame[1];
+  const uint8_t frameType = frame[2];
+  const uint8_t expectedCrc = frame[frameSize - 1];
+  const uint8_t actualCrc = crc8DvbS2(&frame[2], frameLength - 1);
+  if (expectedCrc != actualCrc) {
+    return;
+  }
+
+  const uint8_t payloadLen = frameLength - 2;
+  const uint8_t *payload = &frame[3];
+  if (frameType == CrsfConfig::kFrameTypeGps) {
+    processGpsTelemetryPayload(payload, payloadLen);
+  }
+}
+
+void resetCrsfRxParser() {
+  gCrsfRxParser.index = 0;
+  gCrsfRxParser.expectedSize = 0;
+}
+
+void feedCrsfTelemetryByte(uint8_t byte) {
+  if (gCrsfRxParser.index == 0) {
+    gCrsfRxParser.frame[gCrsfRxParser.index++] = byte;
+    return;
+  }
+
+  if (gCrsfRxParser.index == 1) {
+    if (byte < 2 || byte + 2 > CrsfConfig::kMaxFrameSize) {
+      resetCrsfRxParser();
+      return;
+    }
+
+    gCrsfRxParser.frame[gCrsfRxParser.index++] = byte;
+    gCrsfRxParser.expectedSize = byte + 2;
+    return;
+  }
+
+  gCrsfRxParser.frame[gCrsfRxParser.index++] = byte;
+  if (gCrsfRxParser.index >= gCrsfRxParser.expectedSize) {
+    processCrsfTelemetryFrame(gCrsfRxParser.frame, gCrsfRxParser.expectedSize);
+    resetCrsfRxParser();
+  }
+}
+
+void readCrsfTelemetry() {
+  if (ReceiverConfig::kCrsfRxPin < 0) {
+    return;
+  }
+
+  while (Serial2.available() > 0) {
+    feedCrsfTelemetryByte(static_cast<uint8_t>(Serial2.read()));
+  }
+}
 uint16_t rcUsToCrsf(uint16_t us) {
   const uint16_t limitedUs = clampRc(us);
   const int32_t centered = static_cast<int32_t>(limitedUs) - ReceiverConfig::kRcMid;
@@ -275,8 +469,53 @@ void setThrottleTarget(uint16_t throttle) {
   targetChannels.throttle = clampRc(throttle);
 }
 
+void resetAltitudeHold() {
+  // Force next hover entry to capture a fresh reference altitude.
+  gAltitudeHold = AltitudeHoldState{};
+}
+
+void captureAltitudeHoldTargetIfNeeded() {
+  if (gAltitudeHold.engaged || !hasRecentGpsFix()) {
+    return;
+  }
+
+  gAltitudeHold.targetAltitudeCm = gGpsTelemetry.altitudeCm;
+  gAltitudeHold.engaged = true;
+}
+
+uint16_t applyAltitudeHoldAssist(uint16_t baseHoverThrottleUs) {
+  // Fallback to static hover throttle when assist is disabled or telemetry is stale.
+  if (!ReceiverConfig::kEnableGpsAltitudeHoldAssist || !hasRecentGpsFix()) {
+    return baseHoverThrottleUs;
+  }
+
+  captureAltitudeHoldTargetIfNeeded();
+  if (!gAltitudeHold.engaged) {
+    return baseHoverThrottleUs;
+  }
+
+  const int32_t errorCm = gAltitudeHold.targetAltitudeCm - gGpsTelemetry.altitudeCm;
+  // Deadband avoids hunting from GPS altitude jitter around the target.
+  if (abs(errorCm) <= ReceiverConfig::kAltitudeHoldDeadbandCm) {
+    return baseHoverThrottleUs;
+  }
+
+  const float errorMeters = static_cast<float>(errorCm) / 100.0f;
+  int correctionPercent = static_cast<int>(errorMeters * ReceiverConfig::kAltitudeHoldKpPercentPerMeter);
+  correctionPercent = constrain(
+      correctionPercent,
+      -static_cast<int>(ReceiverConfig::kAltitudeHoldMaxCorrectionPercent),
+      static_cast<int>(ReceiverConfig::kAltitudeHoldMaxCorrectionPercent));
+
+  const int hoverPercent = static_cast<int>(throttleToPercent(baseHoverThrottleUs));
+  const int adjustedPercent = constrain(hoverPercent + correctionPercent, 0, 100);
+  return percentToThrottle(adjustedPercent);
+}
+
 void setHoverThrottleTarget() {
-  setThrottleTarget(gVehicleTuning.hoverThrottle);
+  // Hover throttle remains the baseline; assist only applies bounded bias.
+  const uint16_t baseHoverThrottle = clampRc(gVehicleTuning.hoverThrottle);
+  setThrottleTarget(applyAltitudeHoldAssist(baseHoverThrottle));
 }
 
 void setArmTarget(bool armed) {
@@ -332,6 +571,7 @@ const char* commandToString(uint8_t command) {
     case CMD_DOWN: return "DOWN";
     case CMD_HOVER: return "HOVER";
     case CMD_KILL: return "KILL";
+    case CMD_PING: return "PING";
     default: return "UNKNOWN_CMD";
   }
 }
@@ -409,11 +649,107 @@ void applyMotionTargets(const MotionTargets &motion) {
   if (motion.useHoverThrottle) {
     setHoverThrottleTarget();
   } else {
+    // Any non-hover motion should release altitude hold so the next hover locks to
+    // the new local altitude instead of a stale previous target.
+    resetAltitudeHold();
     setThrottleTarget(makeThrottleFromPercent(motion.throttlePercent));
   }
 }
 
 // ============================================================
+
+bool isDistanceCommand(uint8_t command) {
+  return command == CMD_FORWARD ||
+         command == CMD_BACK ||
+         command == CMD_LEFT ||
+         command == CMD_RIGHT ||
+         command == CMD_UP ||
+         command == CMD_DOWN;
+}
+
+void clearDistanceMove() {
+  gDistanceMove = DistanceMoveState{};
+}
+
+void startDistanceMove(uint8_t command, uint16_t distanceCm) {
+  gDistanceMove.active = distanceCm > 0;
+  gDistanceMove.hasStartGps = hasRecentGpsFix();
+  gDistanceMove.useVerticalDistance = isVerticalDistanceCommand(command);
+  gDistanceMove.command = command;
+  gDistanceMove.targetDistanceCm = distanceCm;
+  gDistanceMove.traveledDistanceCm = 0;
+  gDistanceMove.startLatitudeE7 = gGpsTelemetry.latitudeE7;
+  gDistanceMove.startLongitudeE7 = gGpsTelemetry.longitudeE7;
+  gDistanceMove.startAltitudeCm = gGpsTelemetry.altitudeCm;
+}
+
+uint16_t getDistanceMoveProgressCm() {
+  if (!gDistanceMove.hasStartGps || !hasRecentGpsFix()) {
+    return gDistanceMove.traveledDistanceCm;
+  }
+
+  if (gDistanceMove.useVerticalDistance) {
+    const int32_t altitudeDeltaCm = gGpsTelemetry.altitudeCm - gDistanceMove.startAltitudeCm;
+    const uint32_t absoluteDeltaCm = altitudeDeltaCm < 0 ? static_cast<uint32_t>(-altitudeDeltaCm) : static_cast<uint32_t>(altitudeDeltaCm);
+    return clampDistanceCm(absoluteDeltaCm);
+  }
+
+  return horizontalDistanceCm(
+      gDistanceMove.startLatitudeE7,
+      gDistanceMove.startLongitudeE7,
+      gGpsTelemetry.latitudeE7,
+      gGpsTelemetry.longitudeE7);
+}
+
+uint8_t computeDistanceProfileScalePercent(uint16_t targetDistanceCm, uint16_t traveledDistanceCm) {
+  if (targetDistanceCm == 0) {
+    return 100;
+  }
+  if (traveledDistanceCm >= targetDistanceCm) {
+    return 0;
+  }
+
+  uint16_t halfDistanceCm = (targetDistanceCm + 1) / 2;
+  if (halfDistanceCm == 0) {
+    halfDistanceCm = 1;
+  }
+  const uint16_t remainingDistanceCm = targetDistanceCm - traveledDistanceCm;
+  const uint16_t rampDistanceCm = traveledDistanceCm < remainingDistanceCm ? traveledDistanceCm : remainingDistanceCm;
+  const uint8_t scalePercent = static_cast<uint8_t>((static_cast<uint32_t>(rampDistanceCm) * 100U) / halfDistanceCm);
+
+  return scalePercent < ReceiverConfig::kDistanceProfileMinPercent ? ReceiverConfig::kDistanceProfileMinPercent : scalePercent;
+}
+
+int8_t scaleMotionPercent(int8_t percent, uint8_t scalePercent) {
+  return static_cast<int8_t>((static_cast<int16_t>(percent) * scalePercent) / 100);
+}
+
+MotionTargets applyDistanceProfile(const MotionTargets& motion, uint16_t targetDistanceCm, uint16_t traveledDistanceCm) {
+  MotionTargets profiledMotion = motion;
+  const uint8_t scalePercent = computeDistanceProfileScalePercent(targetDistanceCm, traveledDistanceCm);
+  profiledMotion.pitchPercent = scaleMotionPercent(profiledMotion.pitchPercent, scalePercent);
+  profiledMotion.rollPercent = scaleMotionPercent(profiledMotion.rollPercent, scalePercent);
+  profiledMotion.yawPercent = scaleMotionPercent(profiledMotion.yawPercent, scalePercent);
+  profiledMotion.throttlePercent = scaleMotionPercent(profiledMotion.throttlePercent, scalePercent);
+  return profiledMotion;
+}
+
+MotionTargets motionForCommand(uint8_t command) {
+  switch (command) {
+    case CMD_FORWARD: return cmdForward();
+    case CMD_BACK: return cmdBack();
+    case CMD_LEFT: return cmdLeft();
+    case CMD_RIGHT: return cmdRight();
+    case CMD_YAW_LEFT: return cmdYawLeft();
+    case CMD_YAW_RIGHT: return cmdYawRight();
+    case CMD_UP: return cmdUp();
+    case CMD_DOWN: return cmdDown();
+    case CMD_STOP:
+    case CMD_DISARM: return cmdStop();
+    case CMD_HOVER:
+    default: return cmdHover();
+  }
+}
 // MARK: STATE TARGET UPDATE LOGIC
 // ============================================================
 
@@ -431,7 +767,27 @@ void updateStateTargets() {
       break;
     }
     case DroneState::ACTIVE:
-      // Active state is driven directly by incoming commands, so no need to apply any default targets here.
+      if (gDistanceMove.active) {
+        // Abort autonomous distance motion immediately if GPS quality drops.
+        // This prevents a command from continuing on stale position data.
+        if (!hasRecentGpsFix()) {
+          clearDistanceMove();
+          gDroneState = DroneState::HOVER_FAILSAFE;
+          applyMotionTargets(cmdHover());
+          Serial.println("Distance move aborted: GPS lost, entering hover failsafe");
+          break;
+        }
+
+        gDistanceMove.traveledDistanceCm = getDistanceMoveProgressCm();
+        if (gDistanceMove.traveledDistanceCm >= gDistanceMove.targetDistanceCm) {
+          clearDistanceMove();
+          applyMotionTargets(cmdHover());
+        } else {
+          MotionTargets motion = motionForCommand(gDistanceMove.command);
+          motion = applyDistanceProfile(motion, gDistanceMove.targetDistanceCm, gDistanceMove.traveledDistanceCm);
+          applyMotionTargets(motion);
+        }
+      }
       break;
     case DroneState::HOVER_FAILSAFE:
       applyMotionTargets(cmdHover());
@@ -453,7 +809,9 @@ void updateStateTargets() {
 void applyCommand(const ControlPacket &packet) {
   MotionTargets motion;
   bool applyMotion = true;
+
   if (packet.command == CMD_KILL) {
+    clearDistanceMove();
     gKillLatched = true;
     gDroneState = DroneState::KILL;
     motion = cmdStop();
@@ -464,10 +822,31 @@ void applyCommand(const ControlPacket &packet) {
   if (gKillLatched) {
     return;
   }
+
+  if (isDistanceCommand(packet.command) && packet.distanceCm > 0) {
+    if (!hasRecentGpsFix()) {
+      clearDistanceMove();
+      gDroneState = DroneState::ACTIVE;
+      applyMotionTargets(cmdHover());
+      Serial.println("Distance command rejected: no recent GPS telemetry");
+      return;
+    }
+
+    gDroneState = DroneState::ACTIVE;
+    startDistanceMove(packet.command, packet.distanceCm);
+    motion = motionForCommand(packet.command);
+    motion = applyDistanceProfile(motion, gDistanceMove.targetDistanceCm, gDistanceMove.traveledDistanceCm);
+    applyMotionTargets(motion);
+    return;
+  }
+
+  clearDistanceMove();
+
   switch (packet.command) {
     case CMD_STOP:
     case CMD_DISARM:
       gDroneState = DroneState::IDLE;
+      resetAltitudeHold();
       setArmTarget(false);
       motion = cmdStop();
       break;
@@ -488,47 +867,9 @@ void applyCommand(const ControlPacket &packet) {
       gDroneState = DroneState::LAND_FAILSAFE;
       applyMotion = false;
       break;
-    case CMD_FORWARD:
-      gDroneState = DroneState::ACTIVE;
-      motion = cmdForward();
-      break;
-    case CMD_BACK:
-      gDroneState = DroneState::ACTIVE;
-      motion = cmdBack();
-      break;
-    case CMD_LEFT:
-      gDroneState = DroneState::ACTIVE;
-      motion = cmdLeft();
-      break;
-    case CMD_RIGHT:
-      gDroneState = DroneState::ACTIVE;
-      motion = cmdRight();
-      break;
-    case CMD_YAW_LEFT:
-      gDroneState = DroneState::ACTIVE;
-      motion = cmdYawLeft();
-      break;
-    case CMD_YAW_RIGHT:
-      gDroneState = DroneState::ACTIVE;
-      motion = cmdYawRight();
-      break;
-    case CMD_UP:
-      gDroneState = DroneState::ACTIVE;
-      motion = cmdUp();
-      if (packet.value != 0) {
-        motion.throttlePercent = static_cast<int8_t>(packet.value);
-      }
-      break;
-    case CMD_DOWN:
-      gDroneState = DroneState::ACTIVE;
-      motion = cmdDown();
-      if (packet.value != 0) {
-        motion.throttlePercent = static_cast<int8_t>(packet.value * gVehicleTuning.landingDropMultiplier);
-      }
-      break;
     default:
       gDroneState = DroneState::ACTIVE;
-      motion = cmdHover();
+      motion = motionForCommand(packet.command);
       break;
   }
 
@@ -544,6 +885,48 @@ void applyCommand(const ControlPacket &packet) {
 }
 
 // ============================================================
+
+bool ensureEspNowPeer(const uint8_t* mac) {
+  if (esp_now_is_peer_exist(mac)) {
+    return true;
+  }
+
+  esp_now_peer_info_t peerInfo{};
+  memcpy(peerInfo.peer_addr, mac, 6);
+  peerInfo.channel = ReceiverConfig::kEspNowChannel;
+  peerInfo.encrypt = false;
+  peerInfo.ifidx = WIFI_IF_STA;
+
+  esp_err_t result = esp_now_add_peer(&peerInfo);
+  if (result != ESP_OK) {
+    Serial.print("Failed to add feedback peer, error=");
+    Serial.println(result);
+    return false;
+  }
+
+  return true;
+}
+
+void sendFeedbackPacket(const uint8_t* senderMac, const ControlPacket& packet, uint8_t status) {
+  if (!ensureEspNowPeer(senderMac)) {
+    return;
+  }
+
+  FeedbackPacket feedback{};
+  feedback.seq = packet.seq;
+  feedback.command = packet.command;
+  feedback.status = status;
+  feedback.state = static_cast<uint8_t>(gDroneState);
+  feedback.distanceCm = packet.distanceCm;
+  feedback.progressCm = gDistanceMove.traveledDistanceCm;
+  feedback.receiverMillis = millis();
+
+  esp_err_t result = esp_now_send(senderMac, reinterpret_cast<const uint8_t*>(&feedback), sizeof(feedback));
+  if (result != ESP_OK) {
+    Serial.print("Feedback send failed, error=");
+    Serial.println(result);
+  }
+}
 // MARK: PACKET HANDLING
 // ============================================================
 
@@ -551,12 +934,13 @@ bool isSequenceNewer(uint32_t seq, uint32_t reference) {
   return static_cast<int32_t>(seq - reference) > 0;
 }
 
-bool fetchPendingPacket(ControlPacket &packetOut) {
+bool fetchPendingPacket(ControlPacket &packetOut, uint8_t senderMacOut[6]) {
   bool hasPacket = false;
 
   portENTER_CRITICAL(&gPacketMux);
   if (gHasPendingPacket) {
     packetOut = gPendingPacket;
+    memcpy(senderMacOut, gPendingSenderMac, 6);
     gHasPendingPacket = false;
     hasPacket = true;
   }
@@ -565,10 +949,11 @@ bool fetchPendingPacket(ControlPacket &packetOut) {
   return hasPacket;
 }
 
-void processPacket(const ControlPacket &packet) {
+void processPacket(const ControlPacket &packet, const uint8_t senderMac[6]) {
   if (gLinkStats.hasSeenPacket && !isSequenceNewer(packet.seq, gLinkStats.lastAcceptedSeq)) {
     Serial.print("Ignoring stale/replayed packet seq=");
     Serial.println(packet.seq);
+    sendFeedbackPacket(senderMac, packet, FEEDBACK_REJECTED_STALE);
     return;
   }
 
@@ -576,27 +961,52 @@ void processPacket(const ControlPacket &packet) {
   gLinkStats.lastAcceptedSeq = packet.seq;
   gLinkStats.lastPacketAtMs = millis();
 
-  applyCommand(packet);
+  uint8_t status = FEEDBACK_ACCEPTED;
+  if (isDistanceCommand(packet.command) && packet.distanceCm > 0 && !hasRecentGpsFix()) {
+    status = FEEDBACK_REJECTED_GPS;
+  }
 
-Serial.print("Accepted packet seq=");
-Serial.print(packet.seq);
-Serial.print(" cmd=");
-Serial.print(commandToString(packet.command));
-Serial.print(" value=");
-Serial.print(packet.value);
-Serial.print(" durationMs=");
-Serial.println(packet.durationMs);
+  if (packet.command != CMD_PING) {
+    applyCommand(packet);
+  }
+
+  Serial.print("Accepted packet seq=");
+  Serial.print(packet.seq);
+  Serial.print(" cmd=");
+  Serial.print(commandToString(packet.command));
+  Serial.print(" distanceCm=");
+  Serial.print(packet.distanceCm);
+  Serial.print(" durationMs=");
+  Serial.println(packet.durationMs);
+
+  sendFeedbackPacket(senderMac, packet, status);
 }
 
 // ============================================================
 // MARK: FAILSAFE LOGIC
 // ============================================================
 
+bool isArmedForFailsafe() {
+  // AUX1 high is the project-wide arm signal.
+  return targetChannels.aux1 > ReceiverConfig::kRcMid;
+}
+
+bool isLikelyGrounded() {
+  // Keep a small margin above minimum throttle to avoid false in-flight matches.
+  return currentChannels.throttle <= (ReceiverConfig::kRcMin + 25);
+}
+
 void handleFailsafeTimeouts() {
   if (gKillLatched || gDroneState == DroneState::KILL) {
   return;
   }
   if (!gLinkStats.hasSeenPacket) {
+    return;
+  }
+
+  // Timeout failsafes are flight-only protections; skip while disarmed/idle/grounded.
+  if (!isArmedForFailsafe() || gDroneState == DroneState::IDLE || isLikelyGrounded()) {
+    resetAltitudeHold();
     return;
   }
 
@@ -725,7 +1135,33 @@ void printDebugStatus() {
   Serial.print(currentChannels.yaw);
   Serial.print(" throttle=");
   Serial.print(currentChannels.throttle);
-  Serial.println("]");
+  Serial.print("]");
+
+  Serial.print(" gps[valid=");
+  Serial.print(hasRecentGpsFix() ? "yes" : "no");
+  Serial.print(" sats=");
+  Serial.print(gGpsTelemetry.satellites);
+  Serial.print(" ageMs=");
+  if (gGpsTelemetry.valid) {
+    Serial.print(now - gGpsTelemetry.lastUpdateMs);
+  } else {
+    Serial.print("N/A");
+  }
+  Serial.print(" altCm=");
+  Serial.print(gGpsTelemetry.altitudeCm);
+  Serial.print("]");
+
+  if (gDistanceMove.active) {
+    Serial.print(" distance[targetCm=");
+    Serial.print(gDistanceMove.targetDistanceCm);
+    Serial.print(" traveledCm=");
+    Serial.print(gDistanceMove.traveledDistanceCm);
+    Serial.print(" profilePct=");
+    Serial.print(computeDistanceProfileScalePercent(gDistanceMove.targetDistanceCm, gDistanceMove.traveledDistanceCm));
+    Serial.print("]");
+  }
+
+  Serial.println();
 }
 
 // ============================================================
@@ -765,6 +1201,8 @@ void setup() {
   Serial.print(" at ");
   Serial.print(ReceiverConfig::kCrsfBaud);
   Serial.println(" baud");
+  Serial.print("CRSF telemetry input on GPIO");
+  Serial.println(ReceiverConfig::kCrsfRxPin);
   Serial.print("Receiver MAC: ");
   Serial.println(WiFi.macAddress());
 }
@@ -782,6 +1220,7 @@ void onReceive(const uint8_t *mac, const uint8_t *data, int len) {
 
   portENTER_CRITICAL_ISR(&gPacketMux);
   memcpy(&gPendingPacket, data, sizeof(ControlPacket));
+  memcpy(gPendingSenderMac, mac, 6);
   gHasPendingPacket = true;
   portEXIT_CRITICAL_ISR(&gPacketMux);
 }
@@ -792,10 +1231,12 @@ void onReceive(const uint8_t *mac, const uint8_t *data, int len) {
 
 void loop() {
   ControlPacket packet;
-  if (fetchPendingPacket(packet)) {
-    processPacket(packet);
+  uint8_t senderMac[6] = {};
+  if (fetchPendingPacket(packet, senderMac)) {
+    processPacket(packet, senderMac);
   }
 
+  readCrsfTelemetry();
   handleFailsafeTimeouts();
   updateStateTargets();
   updateCurrentChannels();

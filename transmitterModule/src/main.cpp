@@ -45,14 +45,15 @@ struct ControlPacket {
   uint32_t seq;
   uint8_t command;
   uint16_t distanceCm;
-  uint16_t durationMs;
 } __attribute__((packed));
 
 enum FeedbackStatus : uint8_t {
   FEEDBACK_ACCEPTED = 0,
   FEEDBACK_REJECTED_STALE,
   FEEDBACK_REJECTED_GPS,
-  FEEDBACK_INVALID
+  FEEDBACK_GPS_FALLBACK,
+  FEEDBACK_INVALID,
+  FEEDBACK_REJECTED_KILL
 };
 
 struct FeedbackPacket {
@@ -62,6 +63,9 @@ struct FeedbackPacket {
   uint8_t state;
   uint16_t distanceCm;
   uint16_t progressCm;
+  uint16_t throttleUs;
+  uint16_t targetThrottleUs;
+  uint16_t throttleCrsf;
   uint32_t receiverMillis;
 } __attribute__((packed));
 
@@ -82,6 +86,12 @@ uint32_t gNextSeq = 1;
 char gInputBuffer[SenderConfig::kInputBufferSize];
 size_t gInputPos = 0;
 SentPacketTiming gSentTimings[SenderConfig::kSentTimingSlots];
+volatile bool gNeedsResyncPing = false;
+volatile bool gAwaitingResyncAck = false;
+volatile bool gResyncAcked = false;
+volatile bool gHasRetryAfterResync = false;
+ControlPacket gRetryAfterResyncPacket = {};
+portMUX_TYPE gResyncMux = portMUX_INITIALIZER_UNLOCKED;
 
 // ============================================================
 // MARK: DEBUG HELPERS
@@ -126,7 +136,9 @@ const char* feedbackStatusToString(uint8_t status) {
     case FEEDBACK_ACCEPTED: return "ACCEPTED";
     case FEEDBACK_REJECTED_STALE: return "REJECTED_STALE";
     case FEEDBACK_REJECTED_GPS: return "REJECTED_GPS";
+    case FEEDBACK_GPS_FALLBACK: return "GPS_FALLBACK";
     case FEEDBACK_INVALID: return "INVALID";
+    case FEEDBACK_REJECTED_KILL: return "REJECTED_KILL";
     default: return "UNKNOWN";
   }
 }
@@ -165,10 +177,48 @@ bool startsWithIgnoreCase(const String& input, const String& prefix) {
   tempPrefix.toUpperCase();
   return tempInput.startsWith(tempPrefix);
 }
+bool matchesCommandToken(const String& input, const String& command) {
+  if (!startsWithIgnoreCase(input, command)) {
+    return false;
+  }
+
+  if (input.length() == command.length()) {
+    return true;
+  }
+
+  const char separator = input.charAt(command.length());
+  return separator == ' ' || separator == ':' || separator == '\t';
+}
 
 // ============================================================
 // MARK: PARSING
 // ============================================================
+
+bool isValidFloatToken(const String& token, bool allowSign) {
+  if (token.length() == 0) {
+    return false;
+  }
+
+  bool hasDigit = false;
+  bool hasDecimalPoint = false;
+  for (size_t i = 0; i < token.length(); ++i) {
+    const char c = token.charAt(i);
+    if ((c == '+' || c == '-') && allowSign && i == 0) {
+      continue;
+    }
+    if (c >= '0' && c <= '9') {
+      hasDigit = true;
+      continue;
+    }
+    if (c == '.' && !hasDecimalPoint) {
+      hasDecimalPoint = true;
+      continue;
+    }
+    return false;
+  }
+
+  return hasDigit;
+}
 
 bool tryParseFloatSuffix(const String& input, const String& prefix, float& outValue) {
   if (!startsWithIgnoreCase(input, prefix)) {
@@ -178,7 +228,11 @@ bool tryParseFloatSuffix(const String& input, const String& prefix, float& outVa
   String suffix = input.substring(prefix.length());
   suffix.trim();
 
-  if (suffix.length() == 0) {
+  if (!isValidFloatToken(suffix, true)) {
+    Serial.print("Invalid numeric value for ");
+    Serial.print(prefix);
+    Serial.print(" ");
+    Serial.println(suffix);
     return false;
   }
 
@@ -186,10 +240,30 @@ bool tryParseFloatSuffix(const String& input, const String& prefix, float& outVa
   return true;
 }
 
+bool isValidUnsignedNumberToken(const String& token) {
+  return isValidFloatToken(token, false);
+}
 
+bool tryParseDistanceToken(const String& token, uint16_t& outDistanceCm) {
+  if (!isValidUnsignedNumberToken(token)) {
+    return false;
+  }
+
+  const float distanceCm = token.toFloat();
+  if (distanceCm < 0.0f) {
+    return false;
+  }
+  if (distanceCm > 65535.0f) {
+    outDistanceCm = 65535;
+    return true;
+  }
+
+  outDistanceCm = static_cast<uint16_t>(distanceCm);
+  return true;
+}
 
 bool parseDistanceCm(const String& input, const String& command, uint16_t& outDistanceCm) {
-  if (!startsWithIgnoreCase(input, command)) {
+  if (!matchesCommandToken(input, command)) {
     return false;
   }
 
@@ -201,20 +275,23 @@ bool parseDistanceCm(const String& input, const String& command, uint16_t& outDi
     suffix.trim();
   }
 
+  outDistanceCm = 0;
   if (suffix.length() == 0) {
-    outDistanceCm = 0;
     return true;
   }
 
-  float distanceCm = suffix.toFloat();
-  if (distanceCm < 0.0f) {
-    distanceCm = 0.0f;
-  }
-  if (distanceCm > 65535.0f) {
-    distanceCm = 65535.0f;
+  const int separator = suffix.indexOf(' ');
+  String distanceToken = separator >= 0 ? suffix.substring(0, separator) : suffix;
+  distanceToken.trim();
+
+  if (!tryParseDistanceToken(distanceToken, outDistanceCm)) {
+    Serial.print("Invalid distance for ");
+    Serial.print(command);
+    Serial.print(": ");
+    Serial.println(distanceToken);
+    return false;
   }
 
-  outDistanceCm = static_cast<uint16_t>(distanceCm);
   return true;
 }
 
@@ -233,7 +310,6 @@ ControlPacket makeDefaultPacket() {
   packet.seq = gNextSeq++;
   packet.command = CMD_HOVER;
   packet.distanceCm = 0;
-  packet.durationMs = 0;
   return packet;
 }
 
@@ -250,33 +326,38 @@ bool parseInputToPacket(const String& rawInput, ControlPacket& outPacket) {
   // SYSTEM COMMANDS
   // ----------------------------------------------------------
 
-  if (input == "START" || input == "ARM" || input == "ARISE") {
+  if (matchesCommandToken(input, "START") || matchesCommandToken(input, "ARM") || matchesCommandToken(input, "ARISE")) {
     outPacket.command = CMD_ARM;
     return true;
   }
 
-  if (input == "STOP" || input == "DISARM") {
-    outPacket.command = CMD_STOP;
+  if (matchesCommandToken(input, "DISARM")) {
+    outPacket.command = CMD_DISARM;
     return true;
   }
 
-  if (input == "TAKE_OFF" || input == "TAKEOFF") {
+  if (matchesCommandToken(input, "TAKE_OFF") || matchesCommandToken(input, "TAKEOFF")) {
     outPacket.command = CMD_TAKEOFF;
     return true;
   }
 
-  if (input == "LAND") {
+  if (matchesCommandToken(input, "LAND")) {
     outPacket.command = CMD_LAND;
     return true;
   }
 
-  if (input == "HOVER" || input == "FREEZE" || input == "STAY") {
+  if (matchesCommandToken(input, "HOVER") || matchesCommandToken(input, "STOP") || matchesCommandToken(input, "FREEZE") || matchesCommandToken(input, "STAY") || matchesCommandToken(input, "HOLD") || matchesCommandToken(input, "STEADY")) {
     outPacket.command = CMD_HOVER;
     return true;
   }
 
-  if (input == "KILL") {
+  if (matchesCommandToken(input, "KILL")) {
     outPacket.command = CMD_KILL;
+    return true;
+  }
+
+  if (matchesCommandToken(input, "PING")) {
+    outPacket.command = CMD_PING;
     return true;
   }
 
@@ -308,12 +389,12 @@ bool parseInputToPacket(const String& rawInput, ControlPacket& outPacket) {
     return true;
   }
 
-  if (input == "YAW_LEFT" || input == "TURN_LEFT") {
+  if (matchesCommandToken(input, "YAW_LEFT") || matchesCommandToken(input, "TURN_LEFT")) {
     outPacket.command = CMD_YAW_LEFT;
     return true;
   }
 
-  if (input == "YAW_RIGHT" || input == "TURN_RIGHT") {
+  if (matchesCommandToken(input, "YAW_RIGHT") || matchesCommandToken(input, "TURN_RIGHT")) {
     outPacket.command = CMD_YAW_RIGHT;
     return true;
   }
@@ -357,12 +438,14 @@ bool parseInputToPacket(const String& rawInput, ControlPacket& outPacket) {
 // ============================================================
 
 void onPacketSent(const uint8_t* mac_addr, esp_now_send_status_t status) {
-  Serial.print("Send callback to ");
-  printMacAddress(mac_addr);
-  Serial.print(" status=");
-  Serial.println(status == ESP_NOW_SEND_SUCCESS ? "SUCCESS" : "FAIL");
-}
+  if (status == ESP_NOW_SEND_SUCCESS) {
+    return;
+  }
 
+  Serial.print("TX_FAIL mac=");
+  printMacAddress(mac_addr);
+  Serial.println();
+}
 void onFeedbackReceived(const uint8_t* mac, const uint8_t* data, int len) {
   (void)mac;
 
@@ -381,24 +464,44 @@ void onFeedbackReceived(const uint8_t* mac, const uint8_t* data, int len) {
   const bool hasTiming = consumeSentPacketTime(feedback.seq, sentAtMs);
   const uint32_t latencyMs = hasTiming ? millis() - sentAtMs : 0;
 
-  Serial.print("ACK seq=");
+  Serial.print("ACK#");
   Serial.print(feedback.seq);
-  Serial.print(" cmd=");
+  Serial.print(" ");
   Serial.print(commandToString(feedback.command));
-  Serial.print(" status=");
+  Serial.print(" ");
   Serial.print(feedbackStatusToString(feedback.status));
-  Serial.print(" latencyMs=");
+  Serial.print(" state=");
+  Serial.print(feedback.state);
+  Serial.print(" ");
   if (hasTiming) {
     Serial.print(latencyMs);
   } else {
-    Serial.print("N/A");
+    Serial.print("?");
   }
-  Serial.print(" distanceCm=");
+  Serial.print("ms d=");
   Serial.print(feedback.distanceCm);
-  Serial.print(" progressCm=");
+  Serial.print(" p=");
   Serial.print(feedback.progressCm);
-  Serial.print(" receiverMs=");
-  Serial.println(feedback.receiverMillis);
+  Serial.print(" thr=");
+  Serial.print(feedback.throttleUs);
+  Serial.print("/");
+  Serial.print(feedback.targetThrottleUs);
+  Serial.print(" c=");
+  Serial.println(feedback.throttleCrsf);
+
+  if (feedback.status == FEEDBACK_REJECTED_STALE) {
+    if (feedback.command != CMD_PING) {
+      portENTER_CRITICAL(&gResyncMux);
+      gRetryAfterResyncPacket.command = feedback.command;
+      gRetryAfterResyncPacket.distanceCm = feedback.distanceCm;
+      gHasRetryAfterResync = true;
+      portEXIT_CRITICAL(&gResyncMux);
+    }
+    gNeedsResyncPing = true;
+  } else if (gAwaitingResyncAck && feedback.command == CMD_PING && feedback.status == FEEDBACK_ACCEPTED) {
+    gAwaitingResyncAck = false;
+    gResyncAcked = true;
+  }
 }
 bool addReceiverPeer() {
   esp_now_peer_info_t peerInfo{};
@@ -437,18 +540,47 @@ bool sendPacket(const ControlPacket& packet) {
     return false;
   }
 
-  Serial.print("Sent packet seq=");
+  Serial.print("TX#");
   Serial.print(packet.seq);
-  Serial.print(" cmd=");
+  Serial.print(" ");
   Serial.print(commandToString(packet.command));
-  Serial.print(" distanceCm=");
-  Serial.print(packet.distanceCm);
-  Serial.print(" durationMs=");
-  Serial.println(packet.durationMs);
+  Serial.print(" d=");
+  Serial.println(packet.distanceCm);
 
   return true;
 }
 
+void sendStartupPing() {
+  ControlPacket packet = makeDefaultPacket();
+  packet.command = CMD_PING;
+  packet.distanceCm = 0;
+  sendPacket(packet);
+}
+
+void retryCommandAfterResync() {
+  ControlPacket pendingRetry{};
+  bool hasRetry = false;
+
+  portENTER_CRITICAL(&gResyncMux);
+  if (gHasRetryAfterResync) {
+    pendingRetry = gRetryAfterResyncPacket;
+    gHasRetryAfterResync = false;
+    hasRetry = true;
+  }
+  portEXIT_CRITICAL(&gResyncMux);
+
+  if (!hasRetry) {
+    return;
+  }
+
+  ControlPacket retryPacket = makeDefaultPacket();
+  retryPacket.command = pendingRetry.command;
+  retryPacket.distanceCm = pendingRetry.distanceCm;
+
+  Serial.print("Retry after resync: ");
+  Serial.println(commandToString(retryPacket.command));
+  sendPacket(retryPacket);
+}
 // ============================================================
 // MARK: SERIAL INPUT
 // ============================================================
@@ -484,6 +616,20 @@ void readSerialInput() {
   }
 }
 
+void handleResyncPing() {
+  if (gResyncAcked) {
+    gResyncAcked = false;
+    retryCommandAfterResync();
+  }
+
+  if (!gNeedsResyncPing || gAwaitingResyncAck) {
+    return;
+  }
+
+  gNeedsResyncPing = false;
+  gAwaitingResyncAck = true;
+  sendStartupPing();
+}
 // ============================================================
 // MARK: SETUP / LOOP
 // ============================================================
@@ -493,7 +639,7 @@ void setup() {
   delay(1000);
 
   Serial.println();
-  Serial.println("Sender booting...");
+  Serial.println("TX boot");
 
   WiFi.mode(WIFI_STA);
   WiFi.disconnect();
@@ -515,25 +661,17 @@ void setup() {
     return;
   }
 
-  Serial.print("Sender MAC: ");
-  Serial.println(WiFi.macAddress());
-
-  Serial.print("Receiver MAC: ");
+  Serial.print("MAC ");
+  Serial.print(WiFi.macAddress());
+  Serial.print(" > ");
   printMacAddress(gReceiverMac);
   Serial.println();
 
-  Serial.println("Ready. Type commands like:");
-  Serial.println("ARISE");
-  Serial.println("MOVE_FORWARD 200");
-  Serial.println("MOVE_LEFT:100");
-  Serial.println("TURN_RIGHT");
-  Serial.println("TURN_LEFT");
-  Serial.println("PING");
-  Serial.println("HOVER");
-  Serial.println("LAND");
-  Serial.println("KILL");
+  sendStartupPing();
+  Serial.println("Ready");
 }
 
 void loop() {
+  handleResyncPing();
   readSerialInput();
 }

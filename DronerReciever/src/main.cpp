@@ -521,7 +521,7 @@ uint16_t horizontalDistanceCm(int32_t startLatitudeE7, int32_t startLongitudeE7,
 }
 
 void processGpsTelemetryPayload(const uint8_t *payload, uint8_t payloadLen) {
-  if (payloadLen != CrsfConfig::kGpsPayloadSize) {
+  if (payloadLen < CrsfConfig::kGpsPayloadSize) {
     return;
   }
 
@@ -542,7 +542,7 @@ void processGpsTelemetryPayload(const uint8_t *payload, uint8_t payloadLen) {
 }
 
 void processGpsExtendedTelemetryPayload(const uint8_t *payload, uint8_t payloadLen) {
-  if (payloadLen != CrsfConfig::kGpsExtendedPayloadSize) {
+  if (payloadLen < CrsfConfig::kGpsExtendedPayloadSize) {
     return;
   }
 

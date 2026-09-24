@@ -190,6 +190,8 @@ The thesis-tested integration used an **OmnibusF4SD / STM32F405** flight control
 
 The flight controller remains responsible for low-level stabilization and motor control. The ESP32 receiver supplies RC-equivalent command channels and adds the project-specific command/state/safety layer above it.
 
+CRSFv3 compatibility work is being tracked separately so the known-good 420000-baud Betaflight path stays stable while frame compatibility, extended headers and optional baud negotiation are evaluated. See [`docs/crsf-v3-investigation.md`](docs/crsf-v3-investigation.md).
+
 ---
 
 ## GPS telemetry and bounded movement
@@ -271,7 +273,8 @@ This project is intended to continue beyond the thesis. Possible next steps incl
 - improved synchronized logging across the app, transmitter, receiver and flight controller;
 - better telemetry visualization and tuning tools;
 - additional sensors and autonomous-assistance experiments;
-- continued refinement of landing behaviour beyond fixed-time descent and forced disarm.
+- continued refinement of landing behaviour beyond fixed-time descent and forced disarm;
+- CRSFv3 compatibility work, including parser hardening, richer telemetry and safe baud-rate negotiation experiments.
 
 The roadmap is intentionally broader than the claims made in the thesis.
 

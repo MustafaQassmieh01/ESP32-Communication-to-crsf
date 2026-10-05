@@ -190,6 +190,27 @@ The thesis-tested integration used an **OmnibusF4SD / STM32F405** flight control
 
 The flight controller remains responsible for low-level stabilization and motor control. The ESP32 receiver supplies RC-equivalent command channels and adds the project-specific command/state/safety layer above it.
 
+### Native Betaflight hover mode
+
+On Betaflight 2025.12 and newer, the receiver uses **AUX2** as a native hover-mode switch.
+
+Configure the Betaflight **Modes** tab so that both of these modes are active over the AUX2 high range:
+
+- **ALTHOLD**
+- **POS HOLD**
+
+The receiver raises AUX2 for `HOVER`, after a distance move completes, and during `HOVER_FAILSAFE`. It lowers AUX2 while directional/up/down movement is active and during the receiver's takeoff and landing phases.
+
+The default receiver hover throttle is currently **1400 us**. Betaflight's `hover_throttle` should be tuned to the aircraft so that engaging ALT HOLD does not immediately climb or drop. While AUX2 hover mode is active, the receiver stops applying its own GPS altitude-throttle correction and leaves altitude/position control to the flight controller.
+
+Position Hold requires a valid GPS solution and works best with a correctly configured magnetometer. If the firmware build does not include `ALTITUDE_HOLD` and `POSITION_HOLD`, the AUX2 switch will not provide native hover behavior.
+
+### Landing on newer Betaflight
+
+The normal Betaflight Modes list does **not** expose a dedicated LAND mode. Newer Betaflight does provide an **AUTO-LAND** Stage-2 failsafe procedure, which can be triggered through the FAILSAFE AUX mode when the FC is explicitly configured for it.
+
+The current `LAND` command therefore remains receiver-side timed descent + disarm. Native AUTO-LAND integration is being evaluated separately in issue #5 so that failsafe configuration and recovery behavior are verified before it replaces the existing fallback.
+
 ---
 
 ## GPS telemetry and bounded movement

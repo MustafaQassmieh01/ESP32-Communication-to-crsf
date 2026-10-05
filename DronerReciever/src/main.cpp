@@ -221,6 +221,9 @@ struct MotionTargets {
   int8_t throttlePercent = 0;
   bool useHoverThrottle = true;
   bool useMinimumThrottle = false;
+  // AUX2 is reserved for Betaflight ALT HOLD + POS HOLD.
+  // Only true hover states should assert it; movement/takeoff/landing keep it low.
+  bool enableFcHoverMode = false;
 };
 
 struct DistanceMoveState {
@@ -703,6 +706,11 @@ void setArmTarget(bool armed) {
   targetChannels.aux1 = armed ? ReceiverConfig::kRcMax : ReceiverConfig::kRcMin;
 }
 
+void setFcHoverTarget(bool enabled) {
+  // Configure both ALTHOLD and POS HOLD on Betaflight AUX2's high range.
+  targetChannels.aux2 = enabled ? ReceiverConfig::kRcMax : ReceiverConfig::kRcMin;
+}
+
 uint16_t makeThrottleOffsetFromHover(int offsetPercent) {
   const int limitedOffset = constrain(offsetPercent, -100, 100);
   const int hover = static_cast<int>(clampRc(gVehicleTuning.hoverThrottle));
@@ -781,7 +789,9 @@ MotionTargets cmdStop() {
 }
 
 MotionTargets cmdHover() {
-  return MotionTargets {};
+  MotionTargets motion;
+  motion.enableFcHoverMode = true;
+  return motion;
 }
 
 MotionTargets cmdForward() {
@@ -839,12 +849,21 @@ void applyMotionTargets(const MotionTargets &motion) {
   targetChannels.pitch = makePitchTarget(motion.pitchPercent);
   targetChannels.roll = makeRollTarget(motion.rollPercent);
   targetChannels.yaw = makeYawTarget(motion.yawPercent);
+  setFcHoverTarget(motion.enableFcHoverMode);
 
   if (motion.useMinimumThrottle) {
     resetAltitudeHold();
     setThrottleTarget(ReceiverConfig::kRcMin);
   } else if (motion.useHoverThrottle) {
-    setHoverThrottleTarget();
+    if (motion.enableFcHoverMode) {
+      // Betaflight owns altitude/position control while ALT HOLD + POS HOLD are active.
+      // Keep the stick near the known hover point and do not let the receiver's GPS
+      // altitude assist fight the FC by commanding climb/descent corrections.
+      resetAltitudeHold();
+      setThrottleTarget(clampRc(gVehicleTuning.hoverThrottle));
+    } else {
+      setHoverThrottleTarget();
+    }
   } else {
     // Any non-hover motion should release altitude hold so the next hover locks to
     // the new local altitude instead of a stale previous target.
@@ -973,6 +992,7 @@ void updateStateTargets() {
       }
 
       MotionTargets motion = cmdHover();
+      motion.enableFcHoverMode = false;
       motion.useHoverThrottle = false;
       motion.throttlePercent = static_cast<int8_t>(
           gCommandTuning.powerStepPercent * gVehicleTuning.takeoffLiftMultiplier);
@@ -1015,6 +1035,7 @@ void updateStateTargets() {
       }
 
       MotionTargets motion = cmdHover();
+      motion.enableFcHoverMode = false;
       motion.useHoverThrottle = false;
       motion.throttlePercent = -static_cast<int8_t>(
           gCommandTuning.powerStepPercent * gVehicleTuning.landingDropMultiplier);
@@ -1394,6 +1415,8 @@ void printDebugStatus() {
   Serial.print(rcUsToCrsf(currentChannels.throttle));
   Serial.print(" aux1=");
   Serial.print(currentChannels.aux1);
+  Serial.print(" aux2Hover=");
+  Serial.print(currentChannels.aux2);
   Serial.print("]");
 
   Serial.print(" gps[telemetryReceived=");
